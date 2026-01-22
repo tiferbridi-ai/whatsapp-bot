@@ -1,7 +1,12 @@
 import express from "express";
+import https from "https";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
+
+// ✅ Your Google Apps Script Web App URL
+const SHEETS_WEBAPP_URL =
+  "https://script.google.com/macros/s/AKfycbyhwVt31Ew4gNjMDn_UvFoJTVSPBK6dLDM7X800GRz46T_bpScdr2CtsOQfYIuzFohj/exec";
 
 // Simple in-memory store (temporary). Resets when Render restarts.
 // userState: Map<userId, { dailyLimit: number|null, spentToday: number, lastDate: string }>
@@ -9,8 +14,7 @@ const userState = new Map();
 
 function todayKey() {
   const d = new Date();
-  // YYYY-MM-DD in server time (good enough for MVP)
-  return d.toISOString().slice(0, 10);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD (server time)
 }
 
 function getOrCreateState(userId) {
@@ -20,7 +24,6 @@ function getOrCreateState(userId) {
     return userState.get(userId);
   }
   const state = userState.get(userId);
-  // Reset daily spent if day changed
   if (state.lastDate !== key) {
     state.spentToday = 0;
     state.lastDate = key;
@@ -36,10 +39,10 @@ function extractNumber(text) {
 
 function detectCategory(text) {
   const t = text.toLowerCase();
-
   const hasAny = (arr) => arr.some((w) => t.includes(w));
 
-  if (hasAny(["coffee", "lunch", "dinner", "breakfast", "food", "restaurant", "pizza", "burger", "grocer", "grocery"])) return "Food";
+  if (hasAny(["coffee", "lunch", "dinner", "breakfast", "food", "restaurant", "pizza", "burger", "grocer", "grocery"]))
+    return "Food";
   if (hasAny(["rent", "housing", "mortgage", "lease"])) return "Housing";
   if (hasAny(["gas", "uber", "lyft", "bus", "train", "metro", "transport", "parking"])) return "Transport";
   if (hasAny(["amazon", "clothes", "shopping", "shoes", "store"])) return "Shopping";
@@ -51,12 +54,10 @@ function detectCategory(text) {
 }
 
 function isSetDailyLimit(text) {
-  // Examples: "Daily limit 60" | "Set daily limit 50" | "My daily limit is 80"
   return /daily\s*limit/i.test(text) && /(\d+(\.\d+)?)/.test(text);
 }
 
 function isBalance(text) {
-  // Examples: "Balance today" | "How much left" | "Left today"
   const t = text.toLowerCase();
   return t.includes("balance") || t.includes("left today") || t.includes("how much left");
 }
@@ -72,8 +73,10 @@ function isExpense(text) {
 }
 
 function twimlMessage(msg) {
-  // Basic XML escaping for &, <, >
-  const safe = String(msg).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const safe = String(msg)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
   return `
 <Response>
   <Message>${safe}</Message>
@@ -81,6 +84,46 @@ function twimlMessage(msg) {
 `.trim();
 }
 
+// ---- Google Sheets logger (POST JSON to Apps Script) ----
+function postJson(urlString, data) {
+  return new Promise((resolve, reject) => {
+    try {
+      const url = new URL(urlString);
+      const payload = JSON.stringify(data);
+
+      const options = {
+        method: "POST",
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      };
+
+      const req = https.request(options, (res) => {
+        let body = "";
+        res.on("data", (chunk) => (body += chunk));
+        res.on("end", () => resolve({ status: res.statusCode, body }));
+      });
+
+      req.on("error", reject);
+      req.write(payload);
+      req.end();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// fire-and-forget (don’t block WhatsApp reply)
+function logToSheets(row) {
+  postJson(SHEETS_WEBAPP_URL, row).catch((err) => {
+    console.log("Sheets log error:", String(err));
+  });
+}
+
+// ---- Onboarding text ----
 const onboarding =
   `Hi! 👋\n` +
   `I help you organize your money.\n\n` +
@@ -98,7 +141,6 @@ app.get("/", (req, res) => {
   res.send("OK - bot is running");
 });
 
-// Helpful for testing in browser (GET)
 app.get("/webhook", (req, res) => {
   res.send("Webhook is ready. Twilio must POST here.");
 });
@@ -124,7 +166,19 @@ app.post("/webhook", (req, res) => {
       res.set("Content-Type", "text/xml");
       return res.send(twimlMessage(`❌ I couldn't find a number. Try: Daily limit 60`));
     }
+
     state.dailyLimit = limitValue;
+
+    // Optional: log limit set (type=setting)
+    logToSheets({
+      timestamp: new Date().toISOString(),
+      user: from,
+      type: "setting_daily_limit",
+      amount: limitValue,
+      category: "",
+      dailyLimit: state.dailyLimit,
+      spentToday: state.spentToday,
+    });
 
     res.set("Content-Type", "text/xml");
     return res.send(twimlMessage(`✅ Daily limit set: $${limitValue}`));
@@ -137,7 +191,7 @@ app.post("/webhook", (req, res) => {
 
     let msg = `Today: $${spent} spent`;
     if (limit != null) {
-      const left = Math.max(0, limit - spent);
+      const left = Math.max(0, Number((limit - spent).toFixed(2)));
       msg += ` · $${left} left (limit $${limit})`;
     } else {
       msg += ` · No daily limit set`;
@@ -154,7 +208,18 @@ app.post("/webhook", (req, res) => {
       res.set("Content-Type", "text/xml");
       return res.send(twimlMessage(`❌ I couldn't understand this. Try: Got paid 800 today`));
     }
-    // MVP: we just confirm income; later we can use it for weekly safe-to-spend
+
+    // Log income to Sheets
+    logToSheets({
+      timestamp: new Date().toISOString(),
+      user: from,
+      type: "income",
+      amount,
+      category: "Income",
+      dailyLimit: state.dailyLimit,
+      spentToday: state.spentToday,
+    });
+
     res.set("Content-Type", "text/xml");
     return res.send(twimlMessage(`✅ Saved: $${amount} — Income`));
   }
@@ -170,14 +235,23 @@ app.post("/webhook", (req, res) => {
     const category = detectCategory(text);
     state.spentToday = Number((state.spentToday + amount).toFixed(2));
 
-    // If daily limit exists, show remaining
+    // Log expense to Sheets
+    logToSheets({
+      timestamp: new Date().toISOString(),
+      user: from,
+      type: "expense",
+      amount,
+      category,
+      dailyLimit: state.dailyLimit,
+      spentToday: state.spentToday,
+    });
+
     let msg = `✅ Saved: $${amount} — ${category}`;
     if (state.dailyLimit != null) {
       const left = Math.max(0, Number((state.dailyLimit - state.spentToday).toFixed(2)));
       msg += ` · $${left} left today`;
 
-      // Simple alerts at 80% and 100% (MVP: not throttled)
-      const usedPct = state.spentToday / state.dailyLimit;
+      const usedPct = state.dailyLimit > 0 ? state.spentToday / state.dailyLimit : 0;
       if (usedPct >= 1) {
         msg += `\n🚫 Daily limit reached ($${state.dailyLimit}).`;
       } else if (usedPct >= 0.8) {
@@ -193,6 +267,10 @@ app.post("/webhook", (req, res) => {
   res.set("Content-Type", "text/xml");
   return res.send(twimlMessage(onboarding));
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Server running on port " + PORT));
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port " + PORT));
