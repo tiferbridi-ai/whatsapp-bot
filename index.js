@@ -1,20 +1,17 @@
 import express from "express";
-import https from "https";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ✅ Your Google Apps Script Web App URL
+// ✅ Google Apps Script Web App URL
 const SHEETS_WEBAPP_URL =
   "https://script.google.com/macros/s/AKfycbyhwVt31Ew4gNjMDn_UvFoJTVSPBK6dLDM7X800GRz46T_bpScdr2CtsOQfYIuzFohj/exec";
 
-// Simple in-memory store (temporary). Resets when Render restarts.
-// userState: Map<userId, { dailyLimit: number|null, spentToday: number, lastDate: string }>
+// In-memory state (temporary)
 const userState = new Map();
 
 function todayKey() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD (server time)
+  return new Date().toISOString().slice(0, 10);
 }
 
 function getOrCreateState(userId) {
@@ -33,8 +30,7 @@ function getOrCreateState(userId) {
 
 function extractNumber(text) {
   const match = text.match(/(\d+(\.\d+)?)/);
-  if (!match) return null;
-  return Number(match[1]);
+  return match ? Number(match[1]) : null;
 }
 
 function detectCategory(text) {
@@ -73,57 +69,10 @@ function isExpense(text) {
 }
 
 function twimlMessage(msg) {
-  const safe = String(msg)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  return `
-<Response>
-  <Message>${safe}</Message>
-</Response>
-`.trim();
+  const safe = String(msg).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<Response><Message>${safe}</Message></Response>`;
 }
 
-// ---- Google Sheets logger (POST JSON to Apps Script) ----
-function postJson(urlString, data) {
-  return new Promise((resolve, reject) => {
-    try {
-      const url = new URL(urlString);
-      const payload = JSON.stringify(data);
-
-      const options = {
-        method: "POST",
-        hostname: url.hostname,
-        path: url.pathname + url.search,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-      };
-
-      const req = https.request(options, (res) => {
-        let body = "";
-        res.on("data", (chunk) => (body += chunk));
-        res.on("end", () => resolve({ status: res.statusCode, body }));
-      });
-
-      req.on("error", reject);
-      req.write(payload);
-      req.end();
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
-
-// fire-and-forget (don’t block WhatsApp reply)
-function logToSheets(row) {
-  postJson(SHEETS_WEBAPP_URL, row).catch((err) => {
-    console.log("Sheets log error:", String(err));
-  });
-}
-
-// ---- Onboarding text ----
 const onboarding =
   `Hi! 👋\n` +
   `I help you organize your money.\n\n` +
@@ -134,24 +83,32 @@ const onboarding =
   `Commands:\n` +
   `• Daily limit 60\n` +
   `• Balance today\n\n` +
-  `You can also send voice messages.\n` +
   `Let’s start 🙂`;
 
-app.get("/", (req, res) => {
-  res.send("OK - bot is running");
-});
+// ✅ Sheets logger (with logs for debugging)
+async function logToSheets(row) {
+  try {
+    const r = await fetch(SHEETS_WEBAPP_URL, {
+      method: "POST",
+      redirect: "follow",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(row),
+    });
+    const txt = await r.text();
+    console.log("Sheets status:", r.status, "body:", txt.slice(0, 200));
+  } catch (err) {
+    console.log("Sheets log error:", String(err));
+  }
+}
 
-app.get("/webhook", (req, res) => {
-  res.send("Webhook is ready. Twilio must POST here.");
-});
+app.get("/", (req, res) => res.send("OK - bot is running"));
+app.get("/webhook", (req, res) => res.send("Webhook is ready. Twilio must POST here."));
 
-app.post("/webhook", (req, res) => {
+app.post("/webhook", async (req, res) => {
   const body = (req.body.Body || "").trim();
   const from = req.body.From || "unknown";
-
   const state = getOrCreateState(from);
 
-  // Empty message -> onboarding
   if (!body) {
     res.set("Content-Type", "text/xml");
     return res.send(twimlMessage(onboarding));
@@ -159,18 +116,17 @@ app.post("/webhook", (req, res) => {
 
   const text = body.toLowerCase();
 
-  // 1) Set daily limit
+  // Daily limit
   if (isSetDailyLimit(text)) {
     const limitValue = extractNumber(text);
     if (limitValue == null) {
       res.set("Content-Type", "text/xml");
-      return res.send(twimlMessage(`❌ I couldn't find a number. Try: Daily limit 60`));
+      return res.send(twimlMessage("❌ Try: Daily limit 60"));
     }
 
     state.dailyLimit = limitValue;
 
-    // Optional: log limit set (type=setting)
-    logToSheets({
+    await logToSheets({
       timestamp: new Date().toISOString(),
       user: from,
       type: "setting_daily_limit",
@@ -184,7 +140,7 @@ app.post("/webhook", (req, res) => {
     return res.send(twimlMessage(`✅ Daily limit set: $${limitValue}`));
   }
 
-  // 2) Balance today
+  // Balance
   if (isBalance(text)) {
     const spent = state.spentToday || 0;
     const limit = state.dailyLimit;
@@ -201,16 +157,15 @@ app.post("/webhook", (req, res) => {
     return res.send(twimlMessage(msg));
   }
 
-  // 3) Income
+  // Income
   if (isIncome(text)) {
     const amount = extractNumber(text);
     if (amount == null) {
       res.set("Content-Type", "text/xml");
-      return res.send(twimlMessage(`❌ I couldn't understand this. Try: Got paid 800 today`));
+      return res.send(twimlMessage("❌ Try: Got paid 800"));
     }
 
-    // Log income to Sheets
-    logToSheets({
+    await logToSheets({
       timestamp: new Date().toISOString(),
       user: from,
       type: "income",
@@ -224,19 +179,18 @@ app.post("/webhook", (req, res) => {
     return res.send(twimlMessage(`✅ Saved: $${amount} — Income`));
   }
 
-  // 4) Expense (fallback)
+  // Expense
   if (isExpense(text) || extractNumber(text) != null) {
     const amount = extractNumber(text);
     if (amount == null) {
       res.set("Content-Type", "text/xml");
-      return res.send(twimlMessage(`❌ I couldn't understand this. Try: Spent 12 on lunch`));
+      return res.send(twimlMessage("❌ Try: Spent 12 on lunch"));
     }
 
     const category = detectCategory(text);
     state.spentToday = Number((state.spentToday + amount).toFixed(2));
 
-    // Log expense to Sheets
-    logToSheets({
+    await logToSheets({
       timestamp: new Date().toISOString(),
       user: from,
       type: "expense",
@@ -250,27 +204,16 @@ app.post("/webhook", (req, res) => {
     if (state.dailyLimit != null) {
       const left = Math.max(0, Number((state.dailyLimit - state.spentToday).toFixed(2)));
       msg += ` · $${left} left today`;
-
-      const usedPct = state.dailyLimit > 0 ? state.spentToday / state.dailyLimit : 0;
-      if (usedPct >= 1) {
-        msg += `\n🚫 Daily limit reached ($${state.dailyLimit}).`;
-      } else if (usedPct >= 0.8) {
-        msg += `\n⚠️ You’ve used 80% of your daily limit ($${state.spentToday} of $${state.dailyLimit}).`;
-      }
     }
 
     res.set("Content-Type", "text/xml");
     return res.send(twimlMessage(msg));
   }
 
-  // Default: onboarding
   res.set("Content-Type", "text/xml");
   return res.send(twimlMessage(onboarding));
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port " + PORT));
-
-
+// ✅ ONLY ONE PORT DECLARATION HERE
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port " + PORT));
