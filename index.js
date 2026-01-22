@@ -12,7 +12,16 @@ app.post("/webhook", (req, res) => {
   const body = (req.body.Body || "").trim();
 
   // Resposta mínima para testar
-  const reply = body ? `You said: ${body}` : "Send a message like: Spent 12 on lunch";
+  const onboarding =
+  `Hi! 👋\n` +
+  `I help you organize your money.\n\n` +
+  `Send messages like:\n` +
+  `• Spent 12 on lunch\n` +
+  `• Got paid 800 today\n\n` +
+  `You can also send voice messages.\n` +
+  `Let’s start 🙂`;
+
+const reply = onboarding;
 
   res.set("Content-Type", "text/xml");
   res.send(`
