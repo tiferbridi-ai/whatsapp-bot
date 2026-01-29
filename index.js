@@ -244,7 +244,9 @@ app.post("/twilio/whatsapp", async (req, res) => {
       } catch {
       }
 
-      console.log("Transcript", transcriptText);
+      console.log("Transcript length", transcriptText.length);
+      console.log("Transcript preview", transcriptText.slice(0, 120));
+
 
       if (!transcriptText) {
         const msg = "Eu recebi seu áudio, mas a transcrição veio vazia, tenta falar mais perto do microfone e reenviar.";
