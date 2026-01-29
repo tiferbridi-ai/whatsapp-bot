@@ -1,314 +1,250 @@
+/**
+ * MoneyBot, WhatsApp (Twilio) + Audio Transcription + Reply
+ * Node.js, Express, Render friendly
+ *
+ * Required env vars:
+ * OPENAI_API_KEY
+ * TWILIO_ACCOUNT_SID
+ * TWILIO_AUTH_TOKEN
+ *
+ * Optional (Google Sheets logging):
+ * GOOGLE_SHEETS_SPREADSHEET_ID
+ * GOOGLE_SHEETS_SHEET_NAME
+ * GOOGLE_SERVICE_ACCOUNT_JSON   (the full JSON as a single line string)
+ */
+
 import express from "express";
+import axios from "axios";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import crypto from "crypto";
+import OpenAI from "openai";
+import { google } from "googleapis";
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-// ✅ Google Apps Script Web App URL
-const SHEETS_WEBAPP_URL =
-  "https://script.google.com/macros/s/AKfycbyhwVt31Ew4gNjMDn_UvFoJTVSPBK6dLDM7X800GRz46T_bpScdr2CtsOQfYIuzFohj/exec";
+const {
+  OPENAI_API_KEY,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  GOOGLE_SHEETS_SPREADSHEET_ID,
+  GOOGLE_SHEETS_SHEET_NAME,
+  GOOGLE_SERVICE_ACCOUNT_JSON
+} = process.env;
 
-// ✅ Secrets (set on Render)
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+if (!OPENAI_API_KEY) console.warn("Missing OPENAI_API_KEY");
+if (!TWILIO_ACCOUNT_SID) console.warn("Missing TWILIO_ACCOUNT_SID");
+if (!TWILIO_AUTH_TOKEN) console.warn("Missing TWILIO_AUTH_TOKEN");
 
-// Transcription model
-const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"; // fast/cheap
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// In-memory daily state (temporary)
-const userState = new Map();
+const VALID_AUDIO_TYPES = new Set([
+  "audio/ogg",
+  "application/ogg",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/webm",
+  "audio/mp4",
+  "audio/aac",
+  "audio/amr"
+]);
 
-function todayKey() {
-  return new Date().toISOString().slice(0, 10);
-}
-function getOrCreateState(userId) {
-  const key = todayKey();
-  if (!userState.has(userId)) {
-    userState.set(userId, { dailyLimit: null, spentToday: 0, lastDate: key });
-    return userState.get(userId);
-  }
-  const state = userState.get(userId);
-  if (state.lastDate !== key) {
-    state.spentToday = 0;
-    state.lastDate = key;
-  }
-  return state;
-}
-
-function extractNumber(text) {
-  const match = text.match(/(\d+(\.\d+)?)/);
-  return match ? Number(match[1]) : null;
-}
-
-function detectCategory(text) {
-  const t = text.toLowerCase();
-  const hasAny = (arr) => arr.some((w) => t.includes(w));
-
-  if (hasAny(["coffee", "lunch", "dinner", "breakfast", "food", "restaurant", "pizza", "burger", "grocer", "grocery"]))
-    return "Food";
-  if (hasAny(["rent", "housing", "mortgage", "lease"])) return "Housing";
-  if (hasAny(["gas", "uber", "lyft", "bus", "train", "metro", "transport", "parking"])) return "Transport";
-  if (hasAny(["amazon", "clothes", "shopping", "shoes", "store"])) return "Shopping";
-  if (hasAny(["netflix", "spotify", "subscription", "prime", "hulu", "disney"])) return "Subscriptions";
-  if (hasAny(["doctor", "pharmacy", "hospital", "health", "medicine"])) return "Health";
-  if (hasAny(["movie", "bar", "entertainment", "concert", "game"])) return "Entertainment";
-
-  return "Other";
-}
-
-function isSetDailyLimit(text) {
-  return /daily\s*limit/i.test(text) && /(\d+(\.\d+)?)/.test(text);
-}
-function isBalance(text) {
-  const t = text.toLowerCase();
-  return t.includes("balance") || t.includes("left today") || t.includes("how much left");
-}
-function isIncome(text) {
-  const t = text.toLowerCase();
-  return t.includes("got paid") || t.includes("received") || t.includes("income") || t.includes("earned");
-}
-function isExpense(text) {
-  const t = text.toLowerCase();
-  return t.includes("spent") || t.includes("paid") || t.includes("bought") || t.includes("cost");
-}
-
-function twimlMessage(msg) {
-  const safe = String(msg).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return `<Response><Message>${safe}</Message></Response>`;
-}
-
-const onboarding =
-  `Hi! 👋\n` +
-  `I help you organize your money.\n\n` +
-  `Send messages like:\n` +
-  `• Spent 12 on lunch\n` +
-  `• Paid 45 for gas\n` +
-  `• Got paid 800 today\n\n` +
-  `Commands:\n` +
-  `• Daily limit 60\n` +
-  `• Balance today\n\n` +
-  `You can also send voice messages.\n` +
-  `Let’s start 🙂`;
-
-// ✅ Sheets logger
-async function logToSheets(row) {
+function safeJsonParse(str) {
   try {
-    const r = await fetch(SHEETS_WEBAPP_URL, {
-      method: "POST",
-      redirect: "follow",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(row),
-    });
-    const txt = await r.text();
-    console.log("Sheets status:", r.status, "body:", txt.slice(0, 120));
-  } catch (err) {
-    console.log("Sheets log error:", String(err));
+    return JSON.parse(str);
+  } catch {
+    return null;
   }
 }
 
-// ✅ Twilio media download (Basic Auth)
-async function downloadTwilioMedia(mediaUrl) {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-    throw new Error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in env.");
+async function getSheetsClientIfConfigured() {
+  if (!GOOGLE_SHEETS_SPREADSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON) return null;
+
+  const creds = safeJsonParse(GOOGLE_SERVICE_ACCOUNT_JSON);
+  if (!creds || !creds.client_email || !creds.private_key) {
+    console.warn("GOOGLE_SERVICE_ACCOUNT_JSON is invalid, skipping Sheets logging");
+    return null;
   }
 
-  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-
-  async function tryFetch(url) {
-    const r = await fetch(url, {
-      method: "GET",
-      redirect: "follow",
-      headers: { Authorization: `Basic ${auth}` },
-    });
-
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      throw new Error(`Twilio media download failed: ${r.status} ${t.slice(0, 200)}`);
-    }
-
-    const contentType = r.headers.get("content-type") || "application/octet-stream";
-    const arrayBuffer = await r.arrayBuffer();
-    return { contentType, arrayBuffer };
-  }
-
-  // 1) Try original URL
-  try {
-    return await tryFetch(mediaUrl);
-  } catch (err) {
-    const msg = String(err);
-
-    // 2) If 404, try adding .ogg (common Twilio media variant)
-    if (msg.includes(" 404 ")) {
-      const altUrl = mediaUrl.endsWith(".ogg") ? mediaUrl : `${mediaUrl}.ogg`;
-      console.log("Twilio 404, retrying with:", altUrl);
-      return await tryFetch(altUrl);
-    }
-
-    throw err;
-  }
-}
-
-
-// ✅ OpenAI transcription
-async function transcribeAudio({ arrayBuffer, contentType }) {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY in env.");
-
-  const ext =
-    contentType.includes("ogg") ? "ogg" :
-    contentType.includes("webm") ? "webm" :
-    contentType.includes("wav") ? "wav" :
-    contentType.includes("mpeg") || contentType.includes("mp3") ? "mp3" :
-    "bin";
-
-  const blob = new Blob([arrayBuffer], { type: contentType });
-  const form = new FormData();
-  form.append("model", TRANSCRIBE_MODEL);
-  form.append("response_format", "json");
-  form.append("file", blob, `voice.${ext}`);
-
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: form,
+  const auth = new google.auth.JWT({
+    email: creds.client_email,
+    key: creds.private_key,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
 
-  const json = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    throw new Error(`OpenAI transcription failed: ${r.status} ${JSON.stringify(json).slice(0, 300)}`);
-  }
-  return (json.text || "").trim();
+  const sheets = google.sheets({ version: "v4", auth });
+  return sheets;
 }
 
-// ✅ Unified text handler (typed OR transcribed)
-async function handleTextMessage({ from, text }) {
-  const state = getOrCreateState(from);
-  const lower = (text || "").trim().toLowerCase();
-  if (!lower) return onboarding;
+async function appendToSheet(row) {
+  const sheets = await getSheetsClientIfConfigured();
+  if (!sheets) return;
 
-  if (isSetDailyLimit(lower)) {
-    const limitValue = extractNumber(lower);
-    if (limitValue == null) return `❌ I couldn't find a number. Try: Daily limit 60`;
+  const sheetName = GOOGLE_SHEETS_SHEET_NAME || "Logs";
+  const range = `${sheetName}!A1`;
 
-    state.dailyLimit = limitValue;
-
-    await logToSheets({
-      timestamp: new Date().toISOString(),
-      user: from,
-      type: "setting_daily_limit",
-      amount: limitValue,
-      category: "",
-      dailyLimit: state.dailyLimit,
-      spentToday: state.spentToday,
-    });
-
-    return `✅ Daily limit set: $${limitValue}`;
-  }
-
-  if (isBalance(lower)) {
-    const spent = state.spentToday || 0;
-    const limit = state.dailyLimit;
-
-    let msg = `Today: $${spent} spent`;
-    if (limit != null) {
-      const left = Math.max(0, Number((limit - spent).toFixed(2)));
-      msg += ` · $${left} left (limit $${limit})`;
-    } else {
-      msg += ` · No daily limit set`;
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: GOOGLE_SHEETS_SPREADSHEET_ID,
+    range,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [row]
     }
-    return msg;
-  }
-
-  if (isIncome(lower)) {
-    const amount = extractNumber(lower);
-    if (amount == null) return `❌ Try: Got paid 800 today`;
-
-    await logToSheets({
-      timestamp: new Date().toISOString(),
-      user: from,
-      type: "income",
-      amount,
-      category: "Income",
-      dailyLimit: state.dailyLimit,
-      spentToday: state.spentToday,
-    });
-
-    return `✅ Saved: $${amount} — Income`;
-  }
-
-  if (isExpense(lower) || extractNumber(lower) != null) {
-    const amount = extractNumber(lower);
-    if (amount == null) return `❌ Try: Spent 12 on lunch`;
-
-    const category = detectCategory(lower);
-    state.spentToday = Number((state.spentToday + amount).toFixed(2));
-
-    await logToSheets({
-      timestamp: new Date().toISOString(),
-      user: from,
-      type: "expense",
-      amount,
-      category,
-      dailyLimit: state.dailyLimit,
-      spentToday: state.spentToday,
-    });
-
-    let msg = `✅ Saved: $${amount} — ${category}`;
-    if (state.dailyLimit != null) {
-      const left = Math.max(0, Number((state.dailyLimit - state.spentToday).toFixed(2)));
-      msg += ` · $${left} left today`;
-    }
-    return msg;
-  }
-
-  return onboarding;
+  });
 }
 
-app.get("/", (req, res) => res.send("OK - bot is running"));
-app.get("/webhook", (req, res) => res.send("Webhook is ready. Twilio must POST here."));
+function xmlEscape(s = "") {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
-app.post("/webhook", async (req, res) => {
-  try {
-    const from = req.body.From || "unknown";
-    const typedBody = (req.body.Body || "").trim();
-    const numMedia = Number(req.body.NumMedia || 0);
+function twimlMessage(text) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>${xmlEscape(text)}</Message>
+</Response>`;
+}
 
-    console.log("Incoming message:", { from, numMedia, typedBody });
+async function downloadTwilioMediaToBuffer(mediaUrl) {
+  const res = await axios.get(mediaUrl, {
+    responseType: "arraybuffer",
+    auth: {
+      username: TWILIO_ACCOUNT_SID,
+      password: TWILIO_AUTH_TOKEN
+    },
+    timeout: 30000
+  });
 
-    let finalText = typedBody;
+  const contentType =
+    (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "";
 
-    if (numMedia > 0) {
-      const mediaUrl0 = req.body.MediaUrl0;
-      const mediaType0 = (req.body.MediaContentType0 || "").toLowerCase();
+  return { buffer: Buffer.from(res.data), contentType: String(contentType).toLowerCase() };
+}
 
-      console.log("Media info:", { mediaUrl0, mediaType0 });
+function pickExtensionFromContentType(contentType) {
+  if (!contentType) return "bin";
+  if (contentType.includes("ogg")) return "ogg";
+  if (contentType.includes("mpeg") || contentType.includes("mp3")) return "mp3";
+  if (contentType.includes("wav")) return "wav";
+  if (contentType.includes("webm")) return "webm";
+  if (contentType.includes("mp4")) return "mp4";
+  if (contentType.includes("aac")) return "aac";
+  if (contentType.includes("amr")) return "amr";
+  return "bin";
+}
 
-      const looksLikeAudio =
-        mediaType0.includes("audio") ||
-        mediaType0.includes("ogg") ||
-        mediaType0.includes("opus") ||
-        mediaType0.includes("application");
+async function transcribeAudioFile(tempFilePath) {
+  const result = await openai.audio.transcriptions.create({
+    file: fs.createReadStream(tempFilePath),
+    model: "gpt-4o-transcribe"
+  });
 
-      if (mediaUrl0 && looksLikeAudio) {
-        const { contentType, arrayBuffer } = await downloadTwilioMedia(mediaUrl0);
-        console.log("Downloaded media content-type:", contentType);
+  const text = (result && result.text) ? String(result.text).trim() : "";
+  return text;
+}
 
-        const transcript = await transcribeAudio({ arrayBuffer, contentType });
-        console.log("Transcript:", transcript);
+async function generateBotReply(userText) {
+  const prompt = `Você é o MoneyBot, um assistente objetivo de finanças pessoais.
+Regras, responda em português, curto, claro, com passos acionáveis.
+Se o texto for gasto, categorize e sugira ação rápida.
+Se o texto for uma pergunta, responda direto e peça 1 dado faltante se necessário.
 
-        finalText = transcript;
-      }
-    }
+Entrada do usuário:
+${userText}`;
 
-    const reply = await handleTextMessage({ from, text: finalText });
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: "Você é o MoneyBot, direto e prático." },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.3
+  });
 
-    res.set("Content-Type", "text/xml");
-    return res.send(twimlMessage(reply));
-  } catch (err) {
-    console.log("Webhook error:", String(err));
-    res.set("Content-Type", "text/xml");
-    return res.send(twimlMessage("❌ Sorry — I had trouble processing that voice message. Try sending text."));
-  }
+  const reply =
+    completion?.choices?.[0]?.message?.content
+      ? String(completion.choices[0].message.content).trim()
+      : "Recebi, mas não consegui gerar uma resposta agora.";
+
+  return reply;
+}
+
+app.get("/", (req, res) => {
+  res.status(200).send("MoneyBot is running");
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port " + PORT));
+/**
+ * Twilio WhatsApp webhook
+ * Configure in Twilio, When a message comes in, point to:
+ * https://YOUR-RENDER-URL/twilio/whatsapp
+ */
+app.post("/twilio/whatsapp", async (req, res) => {
+  const nowIso = new Date().toISOString();
+
+  const from = req.body.From || "";
+  const body = (req.body.Body || "").trim();
+
+  const numMedia = Number(req.body.NumMedia || 0);
+
+  console.log("Incoming message", { from, numMedia, body: body ? body.slice(0, 120) : "" });
+
+  try {
+    let transcriptText = "";
+    let mediaInfo = null;
+
+    if (numMedia > 0) {
+      const mediaUrl = req.body.MediaUrl0 || "";
+      const declaredType = String(req.body.MediaContentType0 || "").toLowerCase();
+
+      mediaInfo = { mediaUrl, declaredType };
+
+      console.log("Media info", mediaInfo);
+
+      if (!mediaUrl) {
+        const msg = "Eu vi que veio mídia, mas não recebi o link do áudio, tenta reenviar.";
+        res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+        await appendToSheet([nowIso, from, "media_missing_url", "", declaredType, "", msg]);
+        return;
+      }
+
+      const declaredOk = declaredType ? VALID_AUDIO_TYPES.has(declaredType) : true;
+
+      const { buffer, contentType } = await downloadTwilioMediaToBuffer(mediaUrl);
+      const detectedOk = contentType ? VALID_AUDIO_TYPES.has(contentType) : declaredOk;
+
+      if (!declaredOk && !detectedOk) {
+        const msg = "Recebi a mídia, mas o tipo não parece ser áudio suportado, tenta enviar como mensagem de voz.";
+        res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+        await appendToSheet([nowIso, from, "unsupported_media", "", `${declaredType}|${contentType}`, "", msg]);
+        return;
+      }
+
+      const ext = pickExtensionFromContentType(contentType || declaredType);
+      const fileName = `audio_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${ext}`;
+      const tempFilePath = path.join(os.tmpdir(), fileName);
+
+      fs.writeFileSync(tempFilePath, buffer);
+
+      console.log("Audio saved", { tempFilePath, size: buffer.length, contentType, declaredType });
+
+      transcriptText = await transcribeAudioFile(tempFilePath);
+
+      try {
+        fs.unlinkSync(tempFilePath);
+      } catch {
+        // ignore
+      }
+
+      console.log("Transcript", transcriptText);
+
+      if (!transcriptText) {
+        con
