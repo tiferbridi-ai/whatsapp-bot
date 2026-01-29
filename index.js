@@ -112,32 +112,39 @@ function twimlMessage(text) {
 }
 
 async function downloadTwilioMediaToBuffer(mediaUrl) {
-  const res = await axios.get(mediaUrl, {
-    responseType: "arraybuffer",
-    auth: {
-      username: TWILIO_ACCOUNT_SID,
-      password: TWILIO_AUTH_TOKEN
-    },
-    timeout: 30000
-  });
+  try {
+    const res = await axios.get(mediaUrl, {
+      responseType: "arraybuffer",
+      auth: {
+        username: TWILIO_ACCOUNT_SID,
+        password: TWILIO_AUTH_TOKEN
+      },
+      timeout: 30000,
+      validateStatus: () => true
+    });
 
-  const contentType =
-    (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "";
+    const contentType =
+      (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "";
 
-  return { buffer: Buffer.from(res.data), contentType: String(contentType).toLowerCase() };
+    const ct = String(contentType).toLowerCase();
+    const buf = Buffer.from(res.data);
+
+    if (res.status < 200 || res.status >= 300) {
+      const text = ct.includes("xml") || ct.includes("text") ? buf.toString("utf8") : `[binary ${buf.length} bytes]`;
+      throw new Error(`Twilio media download failed, status ${res.status}, content-type ${ct}, body ${text.slice(0, 800)}`);
+    }
+
+    if (ct.includes("xml")) {
+      const text = buf.toString("utf8");
+      throw new Error(`Twilio returned XML instead of audio, status ${res.status}, body ${text.slice(0, 800)}`);
+    }
+
+    return { buffer: buf, contentType: ct };
+  } catch (err) {
+    throw err;
+  }
 }
 
-function pickExtensionFromContentType(contentType) {
-  if (!contentType) return "bin";
-  if (contentType.includes("ogg")) return "ogg";
-  if (contentType.includes("mpeg") || contentType.includes("mp3")) return "mp3";
-  if (contentType.includes("wav")) return "wav";
-  if (contentType.includes("webm")) return "webm";
-  if (contentType.includes("mp4")) return "mp4";
-  if (contentType.includes("aac")) return "aac";
-  if (contentType.includes("amr")) return "amr";
-  return "bin";
-}
 
 async function transcribeAudioFile(tempFilePath) {
   const result = await openai.audio.transcriptions.create({
