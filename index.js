@@ -111,19 +111,43 @@ async function downloadTwilioMedia(mediaUrl) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
     throw new Error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in env.");
   }
+
   const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-  const r = await fetch(mediaUrl, {
-    method: "GET",
-    headers: { Authorization: `Basic ${auth}` },
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Twilio media download failed: ${r.status} ${t.slice(0, 200)}`);
+
+  async function tryFetch(url) {
+    const r = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      headers: { Authorization: `Basic ${auth}` },
+    });
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`Twilio media download failed: ${r.status} ${t.slice(0, 200)}`);
+    }
+
+    const contentType = r.headers.get("content-type") || "application/octet-stream";
+    const arrayBuffer = await r.arrayBuffer();
+    return { contentType, arrayBuffer };
   }
-  const contentType = r.headers.get("content-type") || "application/octet-stream";
-  const arrayBuffer = await r.arrayBuffer();
-  return { contentType, arrayBuffer };
+
+  // 1) Try original URL
+  try {
+    return await tryFetch(mediaUrl);
+  } catch (err) {
+    const msg = String(err);
+
+    // 2) If 404, try adding .ogg (common Twilio media variant)
+    if (msg.includes(" 404 ")) {
+      const altUrl = mediaUrl.endsWith(".ogg") ? mediaUrl : `${mediaUrl}.ogg`;
+      console.log("Twilio 404, retrying with:", altUrl);
+      return await tryFetch(altUrl);
+    }
+
+    throw err;
+  }
 }
+
 
 // ✅ OpenAI transcription
 async function transcribeAudio({ arrayBuffer, contentType }) {
