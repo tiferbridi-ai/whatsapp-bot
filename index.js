@@ -1,5 +1,5 @@
 /**
- * MoneyBot, WhatsApp (Twilio) + Audio Transcription + Reply
+ * MoneyBot, WhatsApp (Twilio) plus Audio Transcription plus Reply
  * Node.js, Express, Render friendly
  *
  * Required env vars:
@@ -35,9 +35,16 @@ const {
   GOOGLE_SERVICE_ACCOUNT_JSON
 } = process.env;
 
-if (!OPENAI_API_KEY) console.warn("Missing OPENAI_API_KEY");
-if (!TWILIO_ACCOUNT_SID) console.warn("Missing TWILIO_ACCOUNT_SID");
-if (!TWILIO_AUTH_TOKEN) console.warn("Missing TWILIO_AUTH_TOKEN");
+function fatalIfMissing(name, value) {
+  if (!value || String(value).trim() === "") {
+    console.error(`FATAL, missing env var: ${name}`);
+    process.exit(1);
+  }
+}
+
+fatalIfMissing("OPENAI_API_KEY", OPENAI_API_KEY);
+fatalIfMissing("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID);
+fatalIfMissing("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN);
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -67,7 +74,7 @@ async function getSheetsClientIfConfigured() {
 
   const creds = safeJsonParse(GOOGLE_SERVICE_ACCOUNT_JSON);
   if (!creds || !creds.client_email || !creds.private_key) {
-    console.warn("GOOGLE_SERVICE_ACCOUNT_JSON is invalid, skipping Sheets logging");
+    console.warn("Sheets logging disabled, GOOGLE_SERVICE_ACCOUNT_JSON is invalid");
     return null;
   }
 
@@ -112,39 +119,45 @@ function twimlMessage(text) {
 }
 
 async function downloadTwilioMediaToBuffer(mediaUrl) {
-  try {
-    const res = await axios.get(mediaUrl, {
-      responseType: "arraybuffer",
-      auth: {
-        username: TWILIO_ACCOUNT_SID,
-        password: TWILIO_AUTH_TOKEN
-      },
-      timeout: 30000,
-      validateStatus: () => true
-    });
+  const res = await axios.get(mediaUrl, {
+    responseType: "arraybuffer",
+    auth: {
+      username: TWILIO_ACCOUNT_SID,
+      password: TWILIO_AUTH_TOKEN
+    },
+    timeout: 30000,
+    validateStatus: () => true
+  });
 
-    const contentType =
-      (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "";
+  const contentType =
+    (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "";
+  const ct = String(contentType).toLowerCase();
+  const buf = Buffer.from(res.data);
 
-    const ct = String(contentType).toLowerCase();
-    const buf = Buffer.from(res.data);
-
-    if (res.status < 200 || res.status >= 300) {
-      const text = ct.includes("xml") || ct.includes("text") ? buf.toString("utf8") : `[binary ${buf.length} bytes]`;
-      throw new Error(`Twilio media download failed, status ${res.status}, content-type ${ct}, body ${text.slice(0, 800)}`);
-    }
-
-    if (ct.includes("xml")) {
-      const text = buf.toString("utf8");
-      throw new Error(`Twilio returned XML instead of audio, status ${res.status}, body ${text.slice(0, 800)}`);
-    }
-
-    return { buffer: buf, contentType: ct };
-  } catch (err) {
-    throw err;
+  if (res.status < 200 || res.status >= 300) {
+    const text = ct.includes("xml") || ct.includes("text") ? buf.toString("utf8") : `[binary ${buf.length} bytes]`;
+    throw new Error(`Twilio media download failed, status ${res.status}, content-type ${ct}, body ${text.slice(0, 800)}`);
   }
+
+  if (ct.includes("xml")) {
+    const text = buf.toString("utf8");
+    throw new Error(`Twilio returned XML instead of audio, status ${res.status}, body ${text.slice(0, 800)}`);
+  }
+
+  return { buffer: buf, contentType: ct };
 }
 
+function pickExtensionFromContentType(contentType) {
+  if (!contentType) return "bin";
+  if (contentType.includes("ogg")) return "ogg";
+  if (contentType.includes("mpeg") || contentType.includes("mp3")) return "mp3";
+  if (contentType.includes("wav")) return "wav";
+  if (contentType.includes("webm")) return "webm";
+  if (contentType.includes("mp4")) return "mp4";
+  if (contentType.includes("aac")) return "aac";
+  if (contentType.includes("amr")) return "amr";
+  return "bin";
+}
 
 async function transcribeAudioFile(tempFilePath) {
   const result = await openai.audio.transcriptions.create({
@@ -157,42 +170,156 @@ async function transcribeAudioFile(tempFilePath) {
 }
 
 async function generateBotReply(userText) {
+  console.log("USANDO PROMPT NOVO v3");
+
   const prompt = `
-Você é o MoneyBot. Sua resposta tem que ser útil e específica, nunca genérica.
+You are MoneyBot.
+Always respond in the SAME language as the user.
+Never give generic advice.
+Be specific, short, and actionable.
 
-Regras obrigatórias
-1. Comece com "Entendi:" e resuma em 1 linha o que a pessoa disse.
-2. Se tiver um valor, repita o valor. Se não tiver, pergunte o valor.
-3. Dê Categoria e Subcategoria.
-4. Dê 1 ação objetiva de 1 linha.
-5. Faça 1 pergunta curta para completar o registro, apenas se faltar um dado importante.
+Output exactly 5 lines, no extra lines:
+1) Understood: <one short sentence summarizing what the user said>
+2) Category: <one of: Food, Transport, Housing, Bills, Health, Leisure, Shopping, Education, Work, Other>
+3) Subcategory: <one short label>
+4) Action: <one concrete next step>
+5) Question: <ask ONE short question only if something important is missing, otherwise write "ok">
 
-Formato obrigatório
-Entendi: ...
-Categoria: ...
-Subcategoria: ...
-Ação: ...
-Pergunta: ... (se necessário, se não for necessário, escreva "Pergunta: ok")
+If there is a money amount, repeat it in the Understood line.
+If the amount is missing, ask for it in Question.
+If the merchant or place is missing, ask for it in Question.
+Prefer asking only one thing.
 
-Categorias permitidas
-Alimentação, Transporte, Moradia, Contas, Saúde, Lazer, Compras, Educação, Trabalho, Outros
-
-Entrada do usuário:
+User input:
 ${userText}
 `.trim();
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [
-      { role: "system", content: "Responda sempre no formato obrigatório, sem respostas genéricas." },
+      { role: "system", content: "You must follow the exact 5 line format, no extra text." },
       { role: "user", content: prompt }
     ],
-    temperature: 0.4
+    temperature: 0.5
   });
 
   const reply = completion?.choices?.[0]?.message?.content
     ? String(completion.choices[0].message.content).trim()
     : "";
 
-  return reply || "Entendi: sua mensagem, Categoria: Outros, Subcategoria: Outros, Ação: me diga o valor e o local, Pergunta: qual foi o valor";
+  return reply || "Understood: I received your message, Category: Other, Subcategory: Other, Action: tell me the amount and merchant, Question: what was the amount";
 }
+
+app.get("/", (req, res) => {
+  res.status(200).send("MoneyBot is running");
+});
+
+app.post("/twilio/whatsapp", async (req, res) => {
+  const nowIso = new Date().toISOString();
+  const from = req.body.From || "";
+  const body = String(req.body.Body || "").trim();
+  const numMedia = Number(req.body.NumMedia || 0);
+
+  console.log("Incoming message", { from, numMedia, body: body ? body.slice(0, 160) : "" });
+
+  try {
+    let transcriptText = "";
+    let mediaInfo = null;
+
+    if (numMedia > 0) {
+      const mediaUrl = req.body.MediaUrl0 || "";
+      const declaredType = String(req.body.MediaContentType0 || "").toLowerCase();
+
+      mediaInfo = { mediaUrl, declaredType };
+      console.log("Media info", mediaInfo);
+
+      if (!mediaUrl) {
+        const msg = "I received media but no audio link, please resend the voice message.";
+        res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+        await appendToSheet([nowIso, from, "media_missing_url", "", declaredType, "", msg]);
+        return;
+      }
+
+      const declaredOk = declaredType ? VALID_AUDIO_TYPES.has(declaredType) : true;
+
+      const { buffer, contentType } = await downloadTwilioMediaToBuffer(mediaUrl);
+      const detectedOk = contentType ? VALID_AUDIO_TYPES.has(contentType) : declaredOk;
+
+      if (!declaredOk && !detectedOk) {
+        const msg = "I received media but it does not look like supported audio, please send a voice message.";
+        res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+        await appendToSheet([nowIso, from, "unsupported_media", "", `${declaredType}|${contentType}`, "", msg]);
+        return;
+      }
+
+      const ext = pickExtensionFromContentType(contentType || declaredType);
+      const fileName = `audio_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${ext}`;
+      const tempFilePath = path.join(os.tmpdir(), fileName);
+
+      fs.writeFileSync(tempFilePath, buffer);
+
+      console.log("Audio saved", { tempFilePath, size: buffer.length, contentType, declaredType });
+
+      transcriptText = await transcribeAudioFile(tempFilePath);
+
+      try {
+        fs.unlinkSync(tempFilePath);
+      } catch {
+      }
+
+      console.log("Transcript length", transcriptText.length);
+      console.log("Transcript preview", transcriptText.slice(0, 160));
+
+      if (!transcriptText) {
+        const msg = "I received your audio but the transcription was empty, please speak closer to the mic and resend.";
+        res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+        await appendToSheet([nowIso, from, "transcript_empty", "", `${declaredType}|${contentType}`, "", msg]);
+        return;
+      }
+    }
+
+    const userText = transcriptText || body;
+
+    if (!userText) {
+      const msg = "I received your message but it was empty, please send text or audio again.";
+      res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+      await appendToSheet([nowIso, from, "empty_input", "", "", "", msg]);
+      return;
+    }
+
+    const reply = await generateBotReply(userText);
+
+    res.set("Content-Type", "text/xml").status(200).send(twimlMessage(reply));
+
+    await appendToSheet([
+      nowIso,
+      from,
+      transcriptText ? "audio" : "text",
+      userText,
+      mediaInfo ? mediaInfo.declaredType : "",
+      mediaInfo ? mediaInfo.mediaUrl : "",
+      reply
+    ]);
+  } catch (err) {
+    const errMsg =
+      err?.message
+        ? String(err.message)
+        : (err?.response?.data ? String(err.response.data) : String(err));
+
+    console.error("Error handling webhook", errMsg);
+
+    const msg = "I had an error processing your message, please try again.";
+    res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+
+    try {
+      await appendToSheet([nowIso, from, "error", "", "", "", errMsg]);
+    } catch {
+    }
+  }
+});
+
+const port = process.env.PORT || 3000;
+
+app.listen(port, () => {
+  console.log(`MoneyBot listening on port ${port}`);
+});
