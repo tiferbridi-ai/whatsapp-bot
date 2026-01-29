@@ -1,12 +1,18 @@
 {
-  "name": "whatsapp-bot",
+  "name": "moneybot",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^4.19.2"
+    "axios": "^1.7.9",
+    "express": "^4.19.2",
+    "googleapis": "^140.0.0",
+    "openai": "^4.60.0"
   }
 }
