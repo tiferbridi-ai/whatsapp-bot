@@ -10,7 +10,7 @@
  * Optional (Google Sheets logging):
  * GOOGLE_SHEETS_SPREADSHEET_ID
  * GOOGLE_SHEETS_SHEET_NAME
- * GOOGLE_SERVICE_ACCOUNT_JSON   (the full JSON as a single line string)
+ * GOOGLE_SERVICE_ACCOUNT_JSON
  */
 
 import express from "express";
@@ -77,8 +77,7 @@ async function getSheetsClientIfConfigured() {
     scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
 
-  const sheets = google.sheets({ version: "v4", auth });
-  return sheets;
+  return google.sheets({ version: "v4", auth });
 }
 
 async function appendToSheet(row) {
@@ -92,9 +91,7 @@ async function appendToSheet(row) {
     spreadsheetId: GOOGLE_SHEETS_SPREADSHEET_ID,
     range,
     valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [row]
-    }
+    requestBody: { values: [row] }
   });
 }
 
@@ -148,15 +145,15 @@ async function transcribeAudioFile(tempFilePath) {
     model: "gpt-4o-transcribe"
   });
 
-  const text = (result && result.text) ? String(result.text).trim() : "";
+  const text = result && result.text ? String(result.text).trim() : "";
   return text;
 }
 
 async function generateBotReply(userText) {
   const prompt = `Você é o MoneyBot, um assistente objetivo de finanças pessoais.
-Regras, responda em português, curto, claro, com passos acionáveis.
+Responda em português, curto e claro, com passos acionáveis.
 Se o texto for gasto, categorize e sugira ação rápida.
-Se o texto for uma pergunta, responda direto e peça 1 dado faltante se necessário.
+Se o texto for pergunta, responda direto e peça 1 dado faltante se necessário.
 
 Entrada do usuário:
 ${userText}`;
@@ -171,28 +168,21 @@ ${userText}`;
   });
 
   const reply =
-    completion?.choices?.[0]?.message?.content
-      ? String(completion.choices[0].message.content).trim()
-      : "Recebi, mas não consegui gerar uma resposta agora.";
+    completion && completion.choices && completion.choices[0] && completion.choices[0].message
+      ? String(completion.choices[0].message.content || "").trim()
+      : "";
 
-  return reply;
+  return reply || "Recebi, mas não consegui gerar uma resposta agora.";
 }
 
 app.get("/", (req, res) => {
   res.status(200).send("MoneyBot is running");
 });
 
-/**
- * Twilio WhatsApp webhook
- * Configure in Twilio, When a message comes in, point to:
- * https://YOUR-RENDER-URL/twilio/whatsapp
- */
 app.post("/twilio/whatsapp", async (req, res) => {
   const nowIso = new Date().toISOString();
-
   const from = req.body.From || "";
-  const body = (req.body.Body || "").trim();
-
+  const body = String(req.body.Body || "").trim();
   const numMedia = Number(req.body.NumMedia || 0);
 
   console.log("Incoming message", { from, numMedia, body: body ? body.slice(0, 120) : "" });
@@ -206,7 +196,6 @@ app.post("/twilio/whatsapp", async (req, res) => {
       const declaredType = String(req.body.MediaContentType0 || "").toLowerCase();
 
       mediaInfo = { mediaUrl, declaredType };
-
       console.log("Media info", mediaInfo);
 
       if (!mediaUrl) {
@@ -234,17 +223,68 @@ app.post("/twilio/whatsapp", async (req, res) => {
 
       fs.writeFileSync(tempFilePath, buffer);
 
-      console.log("Audio saved", { tempFilePath, size: buffer.length, contentType, declaredType });
+      console.log("Audio saved", {
+        tempFilePath,
+        size: buffer.length,
+        contentType,
+        declaredType
+      });
 
       transcriptText = await transcribeAudioFile(tempFilePath);
 
       try {
         fs.unlinkSync(tempFilePath);
       } catch {
-        // ignore
       }
 
       console.log("Transcript", transcriptText);
 
       if (!transcriptText) {
-        con
+        const msg = "Eu recebi seu áudio, mas a transcrição veio vazia, tenta falar mais perto do microfone e reenviar.";
+        res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+        await appendToSheet([nowIso, from, "transcript_empty", "", `${declaredType}|${contentType}`, "", msg]);
+        return;
+      }
+    }
+
+    const userText = transcriptText || body;
+
+    if (!userText) {
+      const msg = "Eu recebi sua mensagem, mas veio vazia, pode enviar texto ou áudio novamente?";
+      res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+      await appendToSheet([nowIso, from, "empty_input", "", "", "", msg]);
+      return;
+    }
+
+    const reply = await generateBotReply(userText);
+
+    res.set("Content-Type", "text/xml").status(200).send(twimlMessage(reply));
+
+    await appendToSheet([
+      nowIso,
+      from,
+      transcriptText ? "audio" : "text",
+      userText,
+      mediaInfo ? mediaInfo.declaredType : "",
+      mediaInfo ? mediaInfo.mediaUrl : "",
+      reply
+    ]);
+  } catch (err) {
+    const errMsg = err && err.response && err.response.data ? err.response.data : (err && err.message ? err.message : String(err));
+    console.error("Error handling webhook", errMsg);
+
+    const msg = "Tive um erro processando sua mensagem, tenta novamente em alguns segundos.";
+    res.set("Content-Type", "text/xml").status(200).send(twimlMessage(msg));
+
+    try {
+      await appendToSheet([nowIso, from, "error", "", "", "", errMsg]);
+    } catch {
+    }
+  }
+});
+
+const port = process.env.PORT || 3000;
+
+app.listen(port, () => {
+  console.log(`MoneyBot listening on port ${port}`);
+});
